@@ -24,6 +24,7 @@ _TYPE_MAPPING = {
     "string": str,
     "float": float,
     "boolean": bool,
+    "list": list,
 }
 
 
@@ -48,6 +49,7 @@ class Pagination:
     anchor_key: Optional[str]
     cursor_id: Optional[str]
     cursor_key: Optional[str]
+    items_key: Optional[str]
 
     def __init__(self, pdef: Dict[str, Any]) -> None:
 
@@ -57,6 +59,7 @@ class Pagination:
         self.anchor_key = pdef.get("anchor_key")
         self.cursor_id = pdef.get("cursor_id")
         self.cursor_key = pdef.get("cursor_key")
+        self.items_key = pdef.get("items_key")
 
 
 class ImplicitTable:  # pylint: disable=too-many-instance-attributes

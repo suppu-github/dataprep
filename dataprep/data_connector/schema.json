@@ -85,6 +85,18 @@
                         "cursor_key": {
                             "type": "string",
                             "optional": true
+                        },
+                        "items_key": {
+                            "type": "string",
+                            "optional": true
+                        },
+                        "token_key": {
+                            "type": "string",
+                            "optional": true
+                        },
+                        "next_token_key": {
+                            "type": "string",
+                            "optional": true
                         }
                     },
                     "required": [
@@ -283,7 +295,8 @@
                             "int",
                             "float",
                             "boolean",
-                            "object"
+                            "object",
+                            "list"
                         ]
                     },
                     "description": {

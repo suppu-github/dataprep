@@ -89,7 +89,7 @@ class Connector:
         table: ImplicitTable,
         *,
         _count: Optional[int] = None,
-        _cursor: Optional[int] = None,
+        _cursor: Optional[Any] = None,
         _auth: Optional[Dict[str, Any]] = None,
         kwargs: Dict[str, Any],
     ) -> Response:
@@ -135,6 +135,9 @@ class Connector:
             elif pag_type == "limit":
                 assert table.pag_params.anchor_key is not None
                 cursor_key = table.pag_params.anchor_key
+            elif pag_type == "ContinuationToken":
+                assert table.pag_params.cursor_key is not None
+                cursor_key = table.pag_params.cursor_key
             else:
                 raise UnreachableError()
 
@@ -202,6 +205,7 @@ class Connector:
         max_count = itable.pag_params.max_count
         dfs = []
         last_id = 0
+        next_token = ""
         pag_type = itable.pag_params.type
 
         if _count is None:
@@ -233,6 +237,14 @@ class Connector:
                         _cursor=i * max_count,
                         kwargs=where,
                     )
+                elif pag_type == "ContinuationToken":
+                    resp = self._fetch(
+                        table=itable,
+                        _auth=_auth,
+                        _count=cnt_to_fetch,
+                        _cursor=next_token,
+                        kwargs=where,
+                    )
                 else:
                     raise NotImplementedError
                 df_ = itable.from_response(resp)
@@ -243,6 +255,15 @@ class Connector:
 
                 if pag_type == "cursor":
                     last_id = int(df_[itable.pag_params.cursor_id][len(df_) - 1]) - 1
+                if pag_type == "ContinuationToken":
+                    next_token = df_[itable.pag_params.cursor_id]
+                    next_token = (
+                        next_token.values[0]
+                        if isinstance(next_token, pd.Series)
+                        else str(next_token)
+                    )
+                    df_ = df_[itable.pag_params.items_key].values[0]
+                    df_ = pd.DataFrame(df_)
 
                 dfs.append(df_)
 
