@@ -32,6 +32,152 @@ class CorrelationMethod(Enum):
     KendallTau = auto()
 
 
+def calc_corr_df(
+    df: Union[pd.DataFrame, dd.DataFrame],
+    *,
+    value_range: Optional[Tuple[float, float]] = None,
+    k: Optional[int] = None,
+) -> Intermediate:
+
+    assert (value_range is None) or (
+        k is None
+    ), "value_range and k cannot be present in both"
+
+    df = to_dask(df)
+    df.columns = [str(e) for e in df.columns]  # convert column names to string
+
+    df = df.select_dtypes(NUMERICAL_DTYPES)
+    if len(df.columns) == 0:
+        return Intermediate(visual_type=None)
+
+    cordx, cordy, corrs = correlation_nxn(df)
+    cordx, cordy = dd.from_dask_array(cordx), dd.from_dask_array(cordy)
+    columns = df.columns
+
+    dfs = {}
+    for method, corr in corrs.items():
+        df = dd.concat([cordx, cordy, dd.from_dask_array(corr)], axis=1)
+        df.columns = ["x", "y", "correlation"]
+        df = df[df["y"] > df["x"]]  # Retain only lower triangle (w/o diag)
+
+        if k is not None:
+            thresh = df["correlation"].abs().nlargest(k).compute().iloc[-1]
+            df = df[(df["correlation"] >= thresh) | (df["correlation"] <= -thresh)]
+        elif value_range is not None:
+            mask = (value_range[0] <= df["correlation"]) & (
+                df["correlation"] <= value_range[1]
+            )
+            df = df[mask]
+
+        # Translate int x,y coordinates to categorical labels
+        # Hint the return type of the function to dask through param "meta"
+        df["x"] = df["x"].apply(lambda e: columns[e], meta=("x", np.object))
+        df["y"] = df["y"].apply(lambda e: columns[e], meta=("y", np.object))
+        dfs[method.name] = df.compute()
+
+    return Intermediate(
+        data=dfs, axis_range=list(columns.unique()), visual_type="correlation_heatmaps",
+    )
+
+
+def calc_corr_df_x(
+    df: Union[pd.DataFrame, dd.DataFrame],
+    x: Optional[str] = None,
+    *,
+    value_range: Optional[Tuple[float, float]] = None,
+    k: Optional[int] = None,
+) -> Intermediate:
+    """
+    Parameters
+    ----------
+    df
+        The dataframe for which plots are calculated.
+    x
+        A valid column name of the dataframe.
+    value_range
+        If the correlation value is out of the range, don't show it.
+    k
+        Choose top-k element
+    """
+    # pylint: disable=too-many-locals,too-many-statements,too-many-branches
+
+    df = to_dask(df)
+    df.columns = [str(e) for e in df.columns]  # convert column names to string
+
+    df = df.select_dtypes(NUMERICAL_DTYPES)
+    if len(df.columns) == 0:
+        return Intermediate(visual_type=None)
+    assert x in df.columns, f"{x} not in numerical column names"
+
+    columns = df.columns[df.columns != x]
+    xarr = df[x].to_dask_array().compute_chunk_sizes()
+    data = df[columns].to_dask_array().compute_chunk_sizes()
+
+    funcs = [pearson_1xn, spearman_1xn, kendall_tau_1xn]
+
+    dfs = {}
+    for meth, func in zip(CorrelationMethod, funcs):
+        indices, corrs = func(xarr, data, value_range=value_range, k=k)
+        if len(indices) == 0:
+            print(
+                f"Correlation for {meth.name} is empty, try to broaden the value_range.",
+                file=sys.stderr,
+            )
+        df = pd.DataFrame(
+            {
+                "x": np.full(len(indices), x),
+                "y": columns[indices],
+                "correlation": corrs,
+            }
+        )
+        dfs[meth.name] = df
+
+    return Intermediate(data=dfs, visual_type="correlation_single_heatmaps")
+
+
+def calc_corr_df_x_y(
+    df: Union[pd.DataFrame, dd.DataFrame],
+    x: Optional[str] = None,
+    y: Optional[str] = None,
+    *,
+    value_range: Optional[Tuple[float, float]] = None,
+    k: Optional[int] = None,
+) -> Intermediate:
+
+    df = to_dask(df)
+    df.columns = [str(e) for e in df.columns]  # convert column names to string
+    assert value_range is None
+    assert x in df.columns, f"{x} not in columns names"
+    assert y in df.columns, f"{y} not in columns names"
+    df = df.select_dtypes(NUMERICAL_DTYPES)
+    if x in df.columns and y in df.columns:
+        coeffs, df, influences = scatter_with_regression(
+            df[x].values.compute_chunk_sizes(),
+            df[y].values.compute_chunk_sizes(),
+            k=k,
+            sample_size=1000,
+        )
+        result = {
+            "coeffs": dd.compute(coeffs)[0],
+            "data": df.rename(columns={"x": x, "y": y}).compute(),
+        }
+
+        assert (influences is None) == (k is None)
+
+        if influences is not None and k is not None:
+            infidx = np.argsort(influences)
+            labels = np.full(len(influences), "=")
+            # pylint: disable=invalid-unary-operand-type
+            labels[infidx[-k:]] = "-"  # type: ignore
+            # pylint: enable=invalid-unary-operand-type
+            labels[infidx[:k]] = "+"
+            result["data"]["influence"] = labels
+
+        return Intermediate(**result, visual_type="correlation_scatter")
+    else:
+        return Intermediate(visual_type=None)
+
+
 def compute_correlation(
     df: Union[pd.DataFrame, dd.DataFrame],
     x: Optional[str] = None,
@@ -56,115 +202,14 @@ def compute_correlation(
     """
     # pylint: disable=too-many-locals,too-many-statements,too-many-branches
 
-    df = to_dask(df)
-    df.columns = [str(e) for e in df.columns]  # convert column names to string
-
     if x is None and y is None:  # pylint: disable=no-else-return
-        assert (value_range is None) or (
-            k is None
-        ), "value_range and k cannot be present in both"
-
-        df = df.select_dtypes(NUMERICAL_DTYPES)
-        if len(df.columns) == 0:
-            return Intermediate(visual_type=None)
-
-        data = df.to_dask_array()
-        # TODO Can we remove this? Without the computing, data has unknown rows so da.cov will fail.
-        data.compute_chunk_sizes()
-
-        cordx, cordy, corrs = correlation_nxn(data)
-        cordx, cordy = dd.from_dask_array(cordx), dd.from_dask_array(cordy)
-        columns = df.columns
-
-        dfs = {}
-        for method, corr in corrs.items():
-            df = dd.concat([cordx, cordy, dd.from_dask_array(corr)], axis=1)
-            df.columns = ["x", "y", "correlation"]
-            df = df[df["y"] > df["x"]]  # Retain only lower triangle (w/o diag)
-
-            if k is not None:
-                thresh = df["correlation"].abs().nlargest(k).compute().iloc[-1]
-                df = df[(df["correlation"] >= thresh) | (df["correlation"] <= -thresh)]
-            elif value_range is not None:
-                mask = (value_range[0] <= df["correlation"]) & (
-                    df["correlation"] <= value_range[1]
-                )
-                df = df[mask]
-
-            # Translate int x,y coordinates to categorical labels
-            # Hint the return type of the function to dask through param "meta"
-            df["x"] = df["x"].apply(lambda e: columns[e], meta=("x", np.object))
-            df["y"] = df["y"].apply(lambda e: columns[e], meta=("y", np.object))
-            dfs[method.name] = df.compute()
-
-        return Intermediate(
-            data=dfs,
-            axis_range=list(columns.unique()),
-            visual_type="correlation_heatmaps",
-        )
+        return calc_corr_df(df, value_range=value_range, k=k)
     elif x is not None and y is None:
-        df = df.select_dtypes(NUMERICAL_DTYPES)
-        if len(df.columns) == 0:
-            return Intermediate(visual_type=None)
-        assert x in df.columns, f"{x} not in numerical column names"
-
-        columns = df.columns[df.columns != x]
-        xarr = df[x].to_dask_array().compute_chunk_sizes()
-        data = df[columns].to_dask_array().compute_chunk_sizes()
-
-        funcs = [pearson_1xn, spearman_1xn, kendall_tau_1xn]
-
-        dfs = {}
-        for meth, func in zip(CorrelationMethod, funcs):
-            indices, corrs = func(xarr, data, value_range=value_range, k=k)
-            if len(indices) == 0:
-                print(
-                    f"Correlation for {meth.name} is empty, try to broaden the value_range.",
-                    file=sys.stderr,
-                )
-            df = pd.DataFrame(
-                {
-                    "x": np.full(len(indices), x),
-                    "y": columns[indices],
-                    "correlation": corrs,
-                }
-            )
-            dfs[meth.name] = df
-
-        return Intermediate(data=dfs, visual_type="correlation_single_heatmaps")
+        return calc_corr_df_x(df, x=x, value_range=value_range, k=k)
     elif x is None and y is not None:
         raise ValueError("Please give the value to x instead of y")
     elif x is not None and y is not None:
-        assert value_range is None
-        assert x in df.columns, f"{x} not in columns names"
-        assert y in df.columns, f"{y} not in columns names"
-        df = df.select_dtypes(NUMERICAL_DTYPES)
-        if x in df.columns and y in df.columns:
-            coeffs, df, influences = scatter_with_regression(
-                df[x].values.compute_chunk_sizes(),
-                df[y].values.compute_chunk_sizes(),
-                k=k,
-                sample_size=1000,
-            )
-            result = {
-                "coeffs": dd.compute(coeffs)[0],
-                "data": df.rename(columns={"x": x, "y": y}).compute(),
-            }
-
-            assert (influences is None) == (k is None)
-
-            if influences is not None and k is not None:
-                infidx = np.argsort(influences)
-                labels = np.full(len(influences), "=")
-                # pylint: disable=invalid-unary-operand-type
-                labels[infidx[-k:]] = "-"  # type: ignore
-                # pylint: enable=invalid-unary-operand-type
-                labels[infidx[:k]] = "+"
-                result["data"]["influence"] = labels
-
-            return Intermediate(**result, visual_type="correlation_scatter")
-        else:
-            return Intermediate(visual_type=None)
+        return calc_corr_df_x_y(df, x=x, y=y, value_range=value_range, k=k)
 
     raise UnreachableError
 
@@ -245,11 +290,17 @@ def pearson_influence(xarr: da.Array, yarr: da.Array) -> da.Array:
 
 
 def correlation_nxn(
-    data: da.Array, columns: Optional[Sequence[str]] = None
+    df: dd.DataFrame, columns: Optional[Sequence[str]] = None
 ) -> Tuple[da.Array, da.Array, Dict[CorrelationMethod, da.Array]]:
     """
     Calculation of a n x n correlation matrix for n columns
     """
+
+    data = df.to_dask_array()
+
+    # TODO Can we remove this? Without the computing, data has unknown rows so da.cov will fail.
+    data.compute_chunk_sizes()
+
     _, ncols = data.shape
     cordx, cordy = da.meshgrid(range(ncols), range(ncols))
     cordx, cordy = cordy.ravel(), cordx.ravel()
