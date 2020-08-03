@@ -306,7 +306,10 @@ def correlation_nxn(
     cordx, cordy = cordy.ravel(), cordx.ravel()
 
     corrs = {
-        CorrelationMethod.Pearson: pearson_nxn(data).ravel(),
+        CorrelationMethod.Pearson: df.corr(method="pearson")
+        .to_dask_array()
+        .compute_chunk_sizes()
+        .ravel(),
         CorrelationMethod.Spearman: spearman_nxn(data).ravel(),
         CorrelationMethod.KendallTau: kendall_tau_nxn(data).ravel(),
     }
