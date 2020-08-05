@@ -1,5 +1,11 @@
 FROM python:3.7
 
+WORKDIR /workdir
+
 RUN apt update && apt install -y libsnappy-dev
-RUN pip install pandas_profiling docopt contexttimer pandas numpy fastparquet python-snappy missingno
-RUN pip install git+https://github.com/sfu-db/dataprep@perf
+
+COPY build/requirements.txt /workdir
+
+RUN pip install -r /workdir/requirements.txt
+
+RUN pip install -U ipython pyarrow python-snappy dask[complete]

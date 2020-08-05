@@ -1,26 +1,23 @@
-"""Profiling
-
-Usage:
-  profiling --data=<dataset> --row=<row> --col=<col> --mem=<mem> --cpu=<cpu> --mode=<mode> [--partition=<part>] (pandas|dataprep)
-
-Options:
-  -h --help    Show this screen.
-"""
 import logging
-from logging import getLogger
-from pathlib import Path
-from tempfile import TemporaryDirectory
-from time import time
-from typing import Optional
+import sys
+from functools import lru_cache
 from gc import collect
+from json import JSONDecodeError
+from json import dumps as jdumps
+from json import loads as jloads
+from logging import getLogger
+from os import listdir
+from pathlib import Path
+from time import sleep
+from typing import Any, Optional, Tuple
 
+import docker
 import numpy as np
 import pandas as pd
-import dask.dataframe as dd
-from contexttimer import Timer
-from docopt import docopt
-import missingno
+from docker.models.containers import Container
+from sklearn.model_selection import ParameterGrid
 
+from numpyencoder import NumpyEncoder
 
 logger = getLogger(__name__)
 logger.setLevel(logging.DEBUG)
@@ -31,160 +28,194 @@ formatter = logging.Formatter("[{asctime} {levelname}] {name}: {message}", style
 ch.setFormatter(formatter)
 logger.addHandler(ch)
 
+PWD = Path(__file__).resolve().parent
+G = 1024 * 1024 * 1024
+
+RESOURCES = {"memory": 60 * G, "cpu": 8}
+
+
+def grid() -> ParameterGrid:
+    fnames = []
+    for fname in listdir(PWD / "benchmarks"):
+        if fname.endswith(".py") and fname != "lib.py":
+            fnames.append(fname)
+
+    return ParameterGrid(
+        {
+            "dataset": ["adult"],
+            "memory": [1 * G, 2 * G, 4 * G, 8 * G],
+            "cpu": [8],
+            "fname": fnames,
+            "nrow": [50000, 500000, 5000000, 10000000],
+            "ncol": [12],
+            "partition": [16],
+        }
+    )
+
+    # return ParameterGrid(
+    #     {
+    #         "dataset": ["titanic"],
+    #         "memory": [8 * G],
+    #         "cpu": [8],
+    #         "fname": fnames,
+    #         "nrow": [10000],
+    #         "ncol": [12],
+    #         "partition": [16],
+    #     }
+    # )
+
 
 def main() -> None:
-    args = docopt(__doc__)
-    print(args)
+    dclient = docker.from_env()
 
-    dataset = args["--data"]
-    N, M = int(args["--row"]), int(args["--col"])
-    mode = args["--mode"]
-    partition = args.get("--partition")
+    running_jobs = {}
 
-    df = create_dataset(dataset, N)
+    for args in grid():
+        mem = args["memory"]
+        cpu = args["cpu"]
+        fname = args["fname"]
+
+        dpath, size_in_mem = create_dataset(
+            args["dataset"], args["nrow"], args["ncol"], args["partition"]
+        )
+        args["mem_size"] = size_in_mem
+
+        while RESOURCES["memory"] < mem or RESOURCES["cpu"] < cpu:
+            deletions = []
+            # resources is not enough, wait for something to be finished
+            for job, this_args in running_jobs.items():
+                job.reload()
+                if job.status == "exited":
+                    ret = extract_result(job)
+                    if ret is not None:
+                        print(jdumps({**this_args, **ret}, cls=NumpyEncoder))
+                    else:
+                        print(
+                            jdumps({**this_args, "status": "failed"}, cls=NumpyEncoder)
+                        )
+                    sys.stdout.flush()
+
+                    this_mem = this_args["memory"]
+                    this_cpu = this_args["cpu"]
+                    RESOURCES["memory"] += this_mem
+                    RESOURCES["cpu"] += this_cpu
+
+                    deletions.append(job)
+
+            for job in deletions:
+                del running_jobs[job]
+                job.remove()
+
+            if not deletions:
+                sleep(1)
+
+        logger.info(f"Running: {args}, Current Resources: {RESOURCES}")
+
+        RESOURCES["memory"] -= mem
+        RESOURCES["cpu"] -= cpu
+
+        job = dclient.containers.run(
+            "wooya/dataprep-profiling",
+            f"python benchmarks/{fname} {dpath}",
+            detach=True,
+            volumes={
+                str(PWD.parent / "dataprep"): {
+                    "bind": "/workdir/dataprep",
+                    "mode": "ro",
+                },
+                str(PWD / "benchmarks"): {"bind": "/workdir/benchmarks", "mode": "ro",},
+                str(PWD / "data"): {"bind": "/workdir/data", "mode": "ro"},
+            },
+            environment=["PYTHONPATH=/workdir:$PYTHONPATH"],
+            mem_limit=mem,
+            cpu_period=100000,
+            cpu_quota=cpu * 100000,
+        )
+        running_jobs[job] = args
+
+    # Wait for the remaining jobs to be finished
+
+    while running_jobs:
+        deletions = []
+        for job, this_args in running_jobs.items():
+            job.reload()
+            if job.status == "exited":
+                ret = extract_result(job)
+                if ret is not None:
+                    print(jdumps({**this_args, **ret}, cls=NumpyEncoder))
+                else:
+                    print(jdumps({**this_args, "status": "failed"}, cls=NumpyEncoder))
+                sys.stdout.flush()
+                deletions.append(job)
+
+        for job in deletions:
+            del running_jobs[job]
+            job.remove()
+
+        if not deletions:
+            sleep(1)
+
+
+def extract_result(job: Container) -> Any:
+    logs = job.logs()
+    logs = logs.strip()
+    logger.info(f"Log from benchmark {logs.decode()}")
+
+    logs = logs.splitlines()
+
+    ret = None
+    for line in reversed(logs):
+        try:
+            ret = jloads(line)
+            break
+        except JSONDecodeError:
+            pass
+
+    return ret
+
+
+@lru_cache(maxsize=128)
+def create_dataset(
+    dataset: Path,
+    nrow: int,
+    ncol: int,
+    partition: Optional[int] = None,
+    skip: bool = True,
+) -> Tuple[str, float]:
+    fname = f"{dataset}_{nrow}_{ncol}_{partition}.pq"
+    fpath = PWD / "data" / fname
+
+    if skip and fpath.exists():
+        size_in_mem = pd.read_parquet(fpath).memory_usage(deep=True).sum()
+
+        return fname, size_in_mem
+
+    df = pd.read_parquet(f"{PWD/'data'/dataset}.pq")
+
+    logger.info(f"Original DataFrame shape: {df.shape}")
+
+    rep = (int(np.ceil(nrow / len(df))), int(np.ceil(ncol / len(df.columns))))
+
+    df = pd.concat([df] * rep[0])
+    df = pd.concat([df] * rep[1], axis=1)
+    df = df.sample(frac=1).reset_index(drop=True).iloc[:nrow, :ncol]
+
+    logger.info(f"new DataFrame shape: {df.shape}")
+
     df.reset_index(inplace=True)
-    data_in_mem = df.memory_usage(deep=True).sum()
+    size_in_mem = df.memory_usage(deep=True).sum()
 
-    fname = f"{dataset}_{N}_{M}.parquet"
     if partition is not None:
         df["index"] = df["index"] % int(partition)
-        df.to_parquet(fname, partition_cols=["index"])
+        df.to_parquet(fpath, partition_cols=["index"])
     else:
-        df.to_parquet(fname)
+        df.to_parquet(fpath)
 
     # release the memory
     del df
     collect()
 
-    logger.info("Dataset dumped")
-
-    results = []
-
-    if args["pandas"]:
-        logging.info("Benchmarking Pandas-Profiling")
-        from pandas_profiling import ProfileReport
-
-        with TemporaryDirectory() as tdir:
-            with Timer() as timer:
-                df = pd.read_parquet(fname)
-                profile = ProfileReport(
-                    df,
-                    title="Pandas Profiling Report",
-                    config_file=f"{Path(__file__).parent}/pandas-profiling-config.yaml",
-                )
-                profile.to_file(output_file=f"{Path(__file__).parent}/a_report.html")
-
-        print(f"Pandas Profiling Elapsed: {timer.elapsed}s")
-        results.append(
-            {
-                "Mem": args["--mem"],
-                "CPU": args["--cpu"],
-                "Library": "pandas-profiling",
-                "Dataset": dataset,
-                "Row": N,
-                "Col": M,
-                "MSize": data_in_mem,
-                "Elapsed": timer.elapsed,
-            }
-        )
-    else:
-        from dataprep.eda.missing import plot_missing as plot_missing_new
-        from dataprep.eda.missing2 import plot_missing as plot_missing_old
-
-        with TemporaryDirectory() as tdir:
-            with Timer() as timer:
-                logger.info(f"Computing plot_missing_new")
-                if mode == "dask":
-                    df = dd.read_parquet(fname)
-                elif mode == "pandas":
-                    df = pd.read_parquet(fname)
-
-                plot_missing_new(df, bins=100).save(f"{tdir}/report3.html")
-        print(f"missing_new Elapsed: {timer.elapsed}s")
-        results.append(
-            {
-                "Mem": args["--mem"],
-                "CPU": args["--cpu"],
-                "Mode": mode,
-                "Dataset": dataset,
-                "Partition": partition,
-                "Row": N,
-                "Col": M,
-                "MSize": data_in_mem,
-                "Elapsed": timer.elapsed,
-                "Func": "new",
-            }
-        )
-
-        with TemporaryDirectory() as tdir:
-            with Timer() as timer:
-                logger.info(f"Computing plot_missing_old")
-                if mode == "dask":
-                    df = dd.read_parquet(fname)
-                elif mode == "pandas":
-                    df = pd.read_parquet(fname)
-
-                plot_missing_old(df, bins=100).save(f"{tdir}/report3.html")
-
-        print(f"missing_old Elapsed: {timer.elapsed}s")
-        results.append(
-            {
-                "Mem": args["--mem"],
-                "CPU": args["--cpu"],
-                "Mode": mode,
-                "Dataset": dataset,
-                "Partition": partition,
-                "Row": N,
-                "Col": M,
-                "MSize": data_in_mem,
-                "Elapsed": timer.elapsed,
-                "Func": "old",
-            }
-        )
-
-        with TemporaryDirectory() as tdir:
-            with Timer() as timer:
-                logger.info(f"Computing plot_missing_new")
-                df = pd.read_parquet(fname)
-                missingno.matrix(df)
-                missingno.heatmap(df)
-                missingno.bar(df)
-
-        print(f"Missingno Elapsed: {timer.elapsed}s")
-        results.append(
-            {
-                "Mem": args["--mem"],
-                "CPU": args["--cpu"],
-                "Mode": mode,
-                "Dataset": dataset,
-                "Partition": partition,
-                "Row": N,
-                "Col": M,
-                "MSize": data_in_mem,
-                "Elapsed": timer.elapsed,
-                "Func": "missingno",
-            }
-        )
-
-        print(dumps(results, cls=NumpyEncoder))
-
-
-def create_dataset(dataset: str, n: int) -> pd.DataFrame:
-
-    folder = Path(__file__).parent
-    df = pd.read_parquet(f"{folder/dataset}.pq")
-
-    logger.info(f"Original DataFrame shape: {df.shape}")
-
-    rep = int(np.ceil(n / len(df)))
-
-    df = pd.concat([df] * rep)
-
-    df = df.sample(frac=1).reset_index(drop=True)[:n]
-
-    logger.info(f"new DataFrame shape: {df.shape}")
-
-    return df
+    return fname, size_in_mem
 
 
 if __name__ == "__main__":

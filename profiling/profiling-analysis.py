@@ -3,43 +3,38 @@ import pandas as pd
 import altair as alt
 from json import loads
 
+G = 1024 * 1024 * 1024
 ##
-with open("profiling-result-missing.json") as f:
-    lines = f.readlines()
-rs = [r for line in lines for r in loads(line)]
-df = pd.DataFrame(rs)
-df["DVM"] = df["MSize"] / (df["Mem"].str.strip("G").apply(int) * 1024 * 1024 * 1024)
+df = pd.read_json("results/adult_dask_1.json", lines=True)
+df["DVM"] = df["mem_size"] / df["memory"]
+##
+alt.Chart(df[df["DVM"] < 1], title="Plot(df) Comparison").mark_line(point=True).encode(
+    y=alt.Y("elapsed", title="Elapsed (s)"),
+    x=alt.X("DVM", title="Dataset Size / Memory Size"),
+    color="name:N",
+    tooltip="elapsed",
+    column=alt.Column("partition:O", title="Data Loading Mode"),
+)
 
+##
+alt.Chart(
+    df[df.memory == 1 * G], title="Plot Comparison: 8G Mem/8 CPU/16 Data Partition"
+).mark_bar().encode(
+    y="name:N",
+    x=alt.X("elapsed", title="Elapsed (s)"),
+    color="name",
+    tooltip="elapsed",
+    row="nrow:Q",
+    column=alt.Column("partition:O", title="Data Loading Mode"),
+).resolve_scale(
+    x="independent"
+)
 ##
 pdf = df.pivot_table(
     index=["Mem", "CPU", "Dataset", "Partition", "Row", "Col", "Mode"],
     columns="Func",
     values="Elapsed",
 ).reset_index()
-
-##
-alt.Chart(
-    df[df.Mem == "4G"], title="Plot Missing Comparason: 2G Mem/8 CPU/16 Data Partition"
-).mark_bar().encode(
-    y="Func:N",
-    x=alt.X("Elapsed", title="Elapsed (s)"),
-    color="Func",
-    tooltip="Elapsed",
-    row="Row:Q",
-    column=alt.Column("Mode:O", title="Data Loading Mode"),
-).resolve_scale(
-    x="independent"
-)
-
-
-##
-alt.Chart(df, title="Plot Missing Comparison").mark_line(point=True).encode(
-    y=alt.Y("Elapsed", title="Elapsed (s)"),
-    x=alt.X("DVM", title="Dataset Size / Memory Size"),
-    color="Func:N",
-    tooltip="Elapsed",
-    column=alt.Column("Mode:O", title="Data Loading Mode"),
-)
 
 
 ##

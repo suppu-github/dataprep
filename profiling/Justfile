@@ -1,0 +1,7 @@
+build:
+  mkdir -p build
+  # poetry export -f requirements.txt > build/requirements.txt
+  docker build -t wooya/dataprep-profiling .
+
+bench to:
+  python profiling.py | tee -a {{to}}
